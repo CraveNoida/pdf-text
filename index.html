@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PDF → Text (OCR)</title>
+<style>
+:root{--bg:#f7f6f3;--fg:#1f1f1c;--mut:#6b6a63;--card:#fff;--line:#e2e0d8;--ac:#2f5d50;--acfg:#fff;--warn:#c0562f;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161614;--fg:#ecebe6;--mut:#9b9a92;--card:#201f1d;--line:#34332f;--ac:#7fc3ae;--acfg:#10201b;--warn:#e8875f}}
+:root[data-theme="dark"]{--bg:#161614;--fg:#ecebe6;--mut:#9b9a92;--card:#201f1d;--line:#34332f;--ac:#7fc3ae;--acfg:#10201b;--warn:#e8875f}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:880px;margin:0 auto;padding:24px 16px 48px}h1{font-size:22px;margin:0 0 4px}.sub{color:var(--mut);margin:0 0 18px}
+#drop{border:2px dashed var(--line);background:var(--card);border-radius:12px;padding:34px 16px;text-align:center;cursor:pointer}
+#drop.over{border-color:var(--ac)}#drop b{color:var(--ac)}
+.opts{display:flex;flex-wrap:wrap;gap:14px;margin:14px 0;align-items:center;color:var(--mut)}
+input[type=text]{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+button{background:var(--ac);color:var(--acfg);border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer}
+button.sec{background:transparent;color:var(--fg);border:1px solid var(--line)}
+#bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin:14px 0 6px;display:none}#bar i{display:block;height:100%;width:0;background:var(--ac);transition:width .3s}
+#msg{color:var(--mut);min-height:22px}
+.page{background:var(--card);border:1px solid var(--line);border-radius:10px;margin:12px 0;padding:12px 14px}
+.page h3{margin:0 0 8px;font-size:13px;color:var(--mut);display:flex;gap:8px;justify-content:space-between;flex-wrap:wrap;font-weight:500}
+.tag{border:1px solid var(--line);border-radius:99px;padding:0 8px}.low{color:var(--warn)}
+textarea{width:100%;border:0;background:transparent;color:var(--fg);font:15px/1.6 "Noto Sans Devanagari","Nirmala UI",Mangal,system-ui,sans-serif;resize:vertical;outline:none;min-height:120px}
+.thumb{max-width:100%;max-height:220px;border:1px solid var(--line);border-radius:6px;margin:0 0 8px;display:block;background:#fff}
+.toolbar{display:none;gap:8px;margin:12px 0}
+</style></head>
+<body><main>
+<h1>PDF → Text</h1>
+<p class="sub">Upload a PDF or images (JPG, PNG, WEBP…). Pages with real text are read directly; scans and photos are OCR'd (Devanagari + English) right in your browser — files never leave your device. You can also paste an image with Ctrl/⌘+V.</p>
+<div id="drop"><b>Choose PDF or images</b> or drop them here<input id="file" type="file" accept="application/pdf,image/*" multiple hidden></div>
+<div class="opts">
+  <label>PDF pages <input id="pages" type="text" size="8" placeholder="all (e.g. 1-3,5)"></label>
+  <label><input id="force" type="checkbox"> Force OCR on PDFs (ignore text layer)</label>
+</div>
+<div id="bar"><i></i></div><div id="msg"></div>
+<div class="toolbar" id="tb"><button id="dl">Download .txt</button><button class="sec" id="cp">Copy all</button></div>
+<div id="out"></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+<script>
+const OCR_CORE_URL='tesseract-core-lstm.wasm.js', OCR_MODEL_URL='Devanagari.traineddata.gz'; // files sit next to this page
+const $=id=>document.getElementById(id);let docName='document',busy=false;
+if(window.pdfjsLib)pdfjsLib.GlobalWorkerOptions.workerSrc='pdf.worker.min.js'; // real worker script already loaded above → runs on main thread
+
+// ---------- offline OCR engine (Tesseract WASM + Devanagari script model) ----------
+let engine=null,loading=null;
+async function getEngine(say){if(engine)return engine;if(loading)return loading;
+ loading=(async()=>{say('Loading OCR engine (first time only)…');
+  const r=await fetch(OCR_CORE_URL);if(!r.ok)throw new Error('OCR engine download failed ('+r.status+')');
+  const s=document.createElement('script');s.textContent=await r.text();document.head.appendChild(s);
+  if(typeof TesseractCore==='undefined')throw new Error('OCR core did not initialise');
+  const M=await TesseractCore({TesseractProgress(){}});
+  say('Downloading the Devanagari model (11 MB)…');const m=await fetch(OCR_MODEL_URL);if(!m.ok)throw new Error('model download failed ('+m.status+')');
+  const gz=new Uint8Array(await m.arrayBuffer());
+  say('Unpacking the model…');const raw=new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+  M.FS.writeFile('Devanagari.traineddata',raw);const api=new M.TessBaseAPI();if(api.Init(null,'Devanagari',1)!==0)throw new Error('model init failed');
+  api.SetVariable('tessedit_pageseg_mode','3');api.SetVariable('preserve_interword_spaces','1');engine={M,api};return engine;})();
+ try{return await loading;}catch(e){loading=null;throw e;}}
+// ---------- image clean-up + accurate OCR pipeline (pure functions, no DOM) ----------
+function toGray(d,W,H){const g=new Uint8ClampedArray(W*H);for(let i=0,n=W*H;i<n;i++)g[i]=0.299*d[i*4]+0.587*d[i*4+1]+0.114*d[i*4+2];return g;}
+// flatten uneven lighting / coloured boxes / shadows: divide by local background; flip dark pages
+function flatten(g0,W,H){const g=Uint8ClampedArray.from(g0);let s=0,c=0;for(let i=0;i<g.length;i+=7){s+=g[i];c++}
+ if(s/c<100)for(let i=0;i<g.length;i++)g[i]=255-g[i];
+ const r=Math.max(14,Math.round(Math.min(W,H)/32)),W1=W+1,I=new Float64Array(W1*(H+1));
+ for(let y=0;y<H;y++){let row=0;for(let x=0;x<W;x++){row+=g[y*W+x];I[(y+1)*W1+x+1]=I[y*W1+x+1]+row}}
+ const out=new Uint8ClampedArray(W*H);
+ for(let y=0;y<H;y++){const y0=Math.max(0,y-r),y1=Math.min(H,y+r+1);
+  for(let x=0;x<W;x++){const x0=Math.max(0,x-r),x1=Math.min(W,x+r+1);
+   const m=(I[y1*W1+x1]-I[y0*W1+x1]-I[y1*W1+x0]+I[y0*W1+x0])/((y1-y0)*(x1-x0));
+   const v=255*g[y*W+x]/Math.max(40,m*1.06);out[y*W+x]=v>255?255:v;}}
+ return out;}
+function bmpFromGray(g,W,H,pad=0){const BW=W+2*pad,BH=H+2*pad,rb=(BW*3+3)&~3,size=54+rb*BH,b=new Uint8Array(size),dv=new DataView(b.buffer);b.fill(255,54);
+ b[0]=66;b[1]=77;dv.setUint32(2,size,true);dv.setUint32(10,54,true);dv.setUint32(14,40,true);dv.setInt32(18,BW,true);dv.setInt32(22,BH,true);dv.setUint16(26,1,true);dv.setUint16(28,24,true);dv.setUint32(34,rb*BH,true);
+ for(let y=0;y<BH;y++){const row=54+(BH-1-y)*rb;for(let x=0;x<BW;x++){const o=row+x*3,sx=x-pad,sy=y-pad;const v=(sx>=0&&sy>=0&&sx<W&&sy<H)?g[sy*W+sx]:255;b[o]=b[o+1]=b[o+2]=v;}}return b;}
+// crop a text line and upscale it to ~100 px tall (bilinear) → BMP for single-line recognition
+function lineBMP(g,W,H,bx){const ph=Math.round(bx.h*0.3),pw=Math.round(bx.h*0.4);const x0=Math.max(0,bx.x-pw),y0=Math.max(0,bx.y-ph),x1=Math.min(W,bx.x+bx.w+pw),y1=Math.min(H,bx.y+bx.h+ph);
+ const cw=x1-x0,ch=y1-y0;if(cw<4||ch<4)return null;const S=Math.max(1,Math.min(4,100/ch)),OW=Math.round(cw*S),OH=Math.round(ch*S),o=new Uint8ClampedArray(OW*OH);
+ for(let y=0;y<OH;y++){const sy=Math.min(ch-1,(y+.5)/S-.5),a=Math.max(0,sy|0),b=Math.min(ch-1,a+1),fy=sy-a;
+  for(let x=0;x<OW;x++){const sx=Math.min(cw-1,(x+.5)/S-.5),c=Math.max(0,sx|0),d=Math.min(cw-1,c+1),fx=sx-c,p=(yy,xx)=>g[(y0+yy)*W+x0+xx];
+   o[y*OW+x]=p(a,c)*(1-fx)*(1-fy)+p(a,d)*fx*(1-fy)+p(b,c)*(1-fx)*fy+p(b,d)*fx*fy;}}
+ return bmpFromGray(o,OW,OH,32);}
+const LET=/[\u0900-\u097FA-Za-z0-9]/g, DEV=/[\u0900-\u097F]/;
+const nLet=t=>(t.match(LET)||[]).length;
+function parseTSV(tsv){const w=[];for(const row of tsv.split('\n')){const c=row.split('\t');if(c[0]!=='5')continue;
+ const t=c.slice(11).join('\t').trim();if(!t)continue;w.push({blk:+c[2],par:+c[3],ln:+c[4],x:+c[6],y:+c[7],w:+c[8],h:+c[9],conf:+c[10],text:t});}return w;}
+// words -> lines, dropping specks, rules, icon garbage and symbol-only tokens
+function buildLines(words){const hs=words.filter(w=>nLet(w.text)>=2).map(w=>w.h).sort((a,b)=>a-b),med=hs.length?hs[hs.length>>1]:30;let dropped=0;const keep=[];
+ for(const w of words){const L=nLet(w.text),bad=
+  w.conf<25||L===0||w.h<0.3*med||w.w<4||(L<=1&&(w.h/Math.max(1,w.w)>4.5||w.w/Math.max(1,w.h)>6))||(L<=1&&w.conf<55&&!/[0-9।॥]/.test(w.text))||(w.h>3.2*med&&L<=3);
+  if(bad)dropped++;else keep.push(w);}
+ const G=new Map();keep.forEach(w=>{const k=w.blk+'-'+w.par+'-'+w.ln;(G.get(k)||G.set(k,[]).get(k)).push(w)});
+ const lines=[];G.forEach(ws=>{ws.sort((a,b)=>a.x-b.x);const x=Math.min(...ws.map(w=>w.x)),y=Math.min(...ws.map(w=>w.y)),x2=Math.max(...ws.map(w=>w.x+w.w)),y2=Math.max(...ws.map(w=>w.y+w.h));
+  const ch=ws.reduce((s,w)=>s+w.text.length,0)||1;lines.push({x,y,w:x2-x,h:y2-y,text:ws.map(w=>w.text).join(' '),conf:ws.reduce((s,w)=>s+w.conf*w.text.length,0)/ch,minw:Math.min(...ws.map(w=>w.conf)),blk:ws[0].blk,par:ws[0].par});});
+ // lines made only of weak junk (icons, doodles, texture) go
+ const out=lines.filter(l=>{const t=l.text.replace(/\s/g,''),ratio=nLet(t)/Math.max(1,t.length),n=nLet(t);
+  const junk=ratio<0.5||(l.conf<60&&n<8)||(l.conf<50&&n<12)||(l.conf<35&&n<20);if(junk)dropped++;return !junk;});
+ return {lines:out,dropped,med};}
+function cleanLine(t){t=t.replace(/\u00a0/g,' ').replace(/[ \t]+/g,' ').trim();
+ t=t.replace(/^[|।lI!]\s*(?=[.,]|\s)/,'1').replace(/^[|।lI!]\s*\/\s*2\b/,'1/2');       // "।  अङ्गुल" → "1 अङ्गुल"
+ t=t.replace(/^[\s|_~\-—–=•·*#<>\\\/]+(?=\S)/,m=>/[•·]/.test(m)?'• ':'').replace(/[\s|_~=\\\/]+$/,'');   // stray edge symbols
+ if(DEV.test(t))t=t.replace(/\s+([।॥,;:!?])/g,'$1');return t.trim();}
+function assemble(lines,med){const out=[];let p=null;for(const l of lines){const t=cleanLine(l.text);if(!nLet(t))continue;
+  if(p&&(l.blk!==p.blk||l.par!==p.par||l.y-(p.y+p.h)>1.1*med))out.push('');out.push(t);p=l;}return out.join('\n').replace(/\n{3,}/g,'\n\n').trim();}
+// full page: flatten → page OCR → word filter → re-read doubtful lines one by one at 100px height
+function recognizePage(M,api,gray,W,H,opt={}){
+ const run=(g)=>{M.FS.writeFile('/input',bmpFromGray(g,W,H));api.SetVariable('tessedit_pageseg_mode','3');if(api.SetImageFile(1,0)===1)throw new Error('image not readable');api.Recognize(null);
+  const r=buildLines(parseTSV(api.GetTSVText(0)));const tot=r.lines.reduce((s,l)=>s+l.text.length,0)||1;r.conf=r.lines.reduce((s,l)=>s+l.conf*l.text.length,0)/tot;return r;};
+ let g=flatten(gray,W,H),res=run(g);
+ if(res.conf<80){const alt=run(gray);if(alt.conf>res.conf+2){res=alt;g=gray;}}                        // keep whichever reads better
+ let reread=0;const todo=res.lines.filter(l=>(l.conf<80||l.minw<45)&&l.h>8).slice(0,opt.maxReread||80);
+ for(const l of todo){opt.onStep&&opt.onStep(++reread,todo.length);const bmp=lineBMP(g,W,H,l);if(!bmp)continue;
+  M.FS.writeFile('/input',bmp);api.SetVariable('tessedit_pageseg_mode','7');if(api.SetImageFile(1,0)===1)continue;api.Recognize(null);
+  const t=api.GetUTF8Text().trim(),c=api.MeanTextConf();if(nLet(t)&&c>l.conf+3&&nLet(t)>=0.6*nLet(l.text)){l.text=t.replace(/\s*\n\s*/g,' ');l.conf=c;}}
+ api.SetVariable('tessedit_pageseg_mode','3');
+ const text=assemble(res.lines,res.med),tot=res.lines.reduce((s,l)=>s+l.text.length,0)||1;
+ return {text,conf:res.lines.length?res.lines.reduce((s,l)=>s+l.conf*l.text.length,0)/tot:null,dropped:res.dropped,uncertain:res.lines.filter(l=>l.conf<60).length};}
+
+async function ocrCanvas(canvas,say){const {M,api}=await getEngine(say);const W=canvas.width,H=canvas.height;
+ const gray=toGray(canvas.getContext('2d').getImageData(0,0,W,H).data,W,H);let tick=0;
+ const r=recognizePage(M,api,gray,W,H,{onStep:(i,n)=>{if(i%6===1){say(`Reading… refining line ${i} of ${n}`)}}});
+ return {text:r.text,conf:r.conf,dropped:r.dropped,uncertain:r.uncertain};}
+
+// ---------- PDF reading ----------
+function parseRange(spec,n){if(!spec.trim())return Array.from({length:n},(_,i)=>i+1);const o=[];
+ spec.split(',').forEach(p=>{p=p.trim();if(p.includes('-')){const[a,b]=p.split('-').map(Number);for(let i=a;i<=b;i++)o.push(i)}else if(p)o.push(+p)});
+ return o.filter(p=>p>=1&&p<=n);}
+function textLayer(items){ // rebuild lines from positioned text items
+ const rows=[];items.filter(i=>i.str&&i.str.trim()).forEach(i=>{const y=i.transform[5],h=i.height||10;
+  let r=rows.find(r=>Math.abs(r.y-y)<h*0.5);if(!r){r={y,h,it:[]};rows.push(r)}r.it.push({x:i.transform[4],s:i.str,w:i.width})});
+ rows.sort((a,b)=>b.y-a.y);const out=[];let prev=null;
+ rows.forEach(r=>{r.it.sort((a,b)=>a.x-b.x);let line='',end=null;r.it.forEach(t=>{if(end!==null&&t.x-end>r.h*0.15&&!line.endsWith(' ')&&!t.s.startsWith(' '))line+=' ';line+=t.s;end=t.x+t.w});
+  if(prev&&prev.y-r.y>prev.h*1.9)out.push('');out.push(line.trim());prev=r});
+ return out.join('\n');}
+async function renderCanvas(page){const v1=page.getViewport({scale:1});const scale=Math.min(3,Math.max(1.5,1800/v1.width));
+ const vp=page.getViewport({scale}),c=document.createElement('canvas');c.width=Math.floor(vp.width);c.height=Math.floor(vp.height);
+ const ctx=c.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,c.width,c.height);await page.render({canvasContext:ctx,viewport:vp}).promise;return c;}
+
+const esc=t=>String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function addPage(n,text,method,conf,thumb,extra){const d=document.createElement('div');d.className='page';
+ const c=conf==null?'':` · confidence ${Math.round(conf)}%`,low=conf!=null&&conf<70?' <span class="low">low confidence — please proofread</span>':'',ex=extra&&extra.dropped?` <span class="tag" title="Specks, lines, icons and other non-text junk the OCR picked up">${extra.dropped} noise item(s) removed</span>`:'';
+ d.innerHTML=`<h3><span class="pn">${typeof n==="number"?"Page "+n:esc(n)}</span><span><span class="tag">${method}${c}</span>${ex}${low}</span></h3>${thumb?`<img class="thumb" src="${thumb}" alt="">`:""}<textarea spellcheck="false"></textarea>`;
+ const t=d.querySelector('textarea');t.value=text||'(no text found)';t.rows=Math.min(28,t.value.split('\n').length+1);$('out').appendChild(d);}
+
+async function imageCanvas(file){const bmp=await createImageBitmap(file);const long=Math.max(bmp.width,bmp.height);
+ const k=Math.min(3,Math.max(1,1800/Math.min(bmp.width,bmp.height)),3400/long);const c=document.createElement('canvas');c.width=Math.round(bmp.width*k);c.height=Math.round(bmp.height*k);
+ const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.imageSmoothingQuality='high';x.drawImage(bmp,0,0,c.width,c.height);return c;}
+async function start(files){if(busy)return;files=[...files].filter(f=>f.type==='application/pdf'||f.type.startsWith('image/')||/\.pdf$/i.test(f.name));
+ if(!files.length){$('msg').textContent='Please choose a PDF or an image file.';return}
+ busy=true;docName=files.length>1?'extracted-text':files[0].name.replace(/\.[^.]+$/,'')||'pasted-image';$('out').innerHTML='';$('tb').style.display='none';$('bar').style.display='block';
+ const bar=$('bar').firstChild,say=t=>$('msg').textContent=t;bar.style.width='2%';
+ try{const jobs=[];
+  for(const f of files){if(f.type.startsWith('image/'))jobs.push({img:f});else{say('Opening '+f.name+'…');const pdf=await pdfjsLib.getDocument({data:await f.arrayBuffer()}).promise;
+   const prefix=files.length>1?f.name+' · ':'';parseRange($('pages').value,pdf.numPages).forEach(n=>jobs.push({pdf,n,prefix}));}}
+  let i=0;
+  for(const j of jobs){i++;await new Promise(r=>setTimeout(r,20));
+   if(j.img){say(`Item ${i} of ${jobs.length}: reading image…`);const c=await imageCanvas(j.img);const t=document.createElement('canvas');const q=Math.min(1,320/c.height);t.width=c.width*q;t.height=c.height*q;t.getContext('2d').drawImage(c,0,0,t.width,t.height);
+    const r=await ocrCanvas(c,say);addPage(j.img.name||'Pasted image',r.text,'OCR',r.conf,t.toDataURL('image/jpeg',.7),r);}
+   else{say(`Item ${i} of ${jobs.length}…`);const page=await j.pdf.getPage(j.n);const txt=textLayer((await page.getTextContent()).items);const lab=j.prefix?j.prefix+'page '+j.n:j.n;
+    if(!$('force').checked&&(txt.match(/[\u0900-\u097FA-Za-z0-9]/g)||[]).length>=5)addPage(lab,txt,'text layer',null);
+    else{const c=await renderCanvas(page);say(`Item ${i} of ${jobs.length}: reading with OCR…`);await new Promise(r=>setTimeout(r,20));const r=await ocrCanvas(c,say);addPage(lab,r.text,'OCR',r.conf,null,r);}}
+   bar.style.width=(100*i/jobs.length)+'%';}
+  say(`Done — ${jobs.length} item(s). You can edit the text below before downloading.`);$('tb').style.display='flex';
+ }catch(e){say('Error: '+(e.message||e));}
+ busy=false;}
+
+const allText=()=>[...document.querySelectorAll('.page')].map(d=>`--- ${d.querySelector('.pn').textContent} ---\n`+d.querySelector('textarea').value).join('\n\n')+'\n';
+$('dl').onclick=async()=>{const data=allText(),filename=docName+'.txt';
+ try{const dl=await (window.claude?claude.use('downloads'):null);if(dl){await dl.save({filename,data});return}}catch(e){if(e&&e.code==='declined')return}
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type:'text/plain;charset=utf-8'}));a.download=filename;a.click();};
+$('cp').onclick=()=>navigator.clipboard.writeText(allText()).then(()=>$('msg').textContent='Copied to clipboard.').catch(()=>$('msg').textContent='Copy blocked — select the text and copy manually.');
+$('drop').onclick=()=>$('file').click();
+['dragover','dragenter'].forEach(t=>$('drop').addEventListener(t,e=>{e.preventDefault();$('drop').classList.add('over')}));
+['dragleave','drop'].forEach(t=>$('drop').addEventListener(t,e=>{e.preventDefault();$('drop').classList.remove('over')}));
+$('drop').addEventListener('drop',e=>{if(e.dataTransfer.files.length)start(e.dataTransfer.files)});
+$('file').onchange=e=>{if(e.target.files.length)start(e.target.files);e.target.value=''};
+document.addEventListener('paste',e=>{const fs=[...(e.clipboardData?.files||[])].filter(f=>f.type.startsWith('image/'));if(fs.length){e.preventDefault();start(fs)}});
+</script>
+</body></html>
